@@ -31,7 +31,24 @@ def read_models(path):
         return dict(BUILTIN), {}
 
 
+def read_gamma(path):
+    """models.json -> {model: [gr, gg, gb]} for linear-drive fixtures measured with chroma gamma."""
+    try:
+        out = {}
+        for sku, m in json.loads(Path(path).read_text())["models"].items():
+            g = m.get("gamma")
+            if g is None:
+                continue
+            if (isinstance(g, list) and len(g) == 3
+                    and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0 for v in g)):
+                out[sku] = list(g)
+        return out
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
+
+
 STREAMED, UNTESTED = read_models(HERE / "models.json")
+GAMMA = read_gamma(HERE / "models.json")
 MODELS = {sku: {"bulbs": n, "razer": True} for sku, n in STREAMED.items()} | {"H6008": {"bulbs": 1, "razer": False}}  # false = no streaming
 BASIC = MODELS["H6008"]
 FPS = 12
@@ -333,6 +350,28 @@ def razer(key, raw):
     for v in raw:
         x ^= v
     send(key, "razer", {"pt": base64.b64encode(bytes(raw + [x])).decode()})
+
+
+def chroma_gamma(colors, gamma):
+    """Re-encode each color's minor channels against its brightest one, c' = max * (c/max)**g, weighted
+    by saturation so near-whites keep no tint. Ported from andyed/suffuse scripts/lan.mjs chromaGamma."""
+    if not gamma:
+        return colors
+    out = []
+    for c in colors:
+        ch = [max(0, v) for v in c]
+        m = max(ch)
+        if not m:
+            out.append([0, 0, 0]); continue
+        u = max(0, min(1, ((m - min(ch)) / m - .05) / .3))  # identity at saturation .05, full from .35
+        fade = u * u * (3 - 2 * u)
+        px = []
+        for v, g in zip(ch, gamma):
+            e = 1 + (g - 1) * fade
+            enc = v if v == m or e == 1 else m * (v / m) ** e
+            px.append(round(enc) if enc >= 1 else 0)  # below one step is off, so it cannot flicker back on
+        out.append(px)
+    return out
 
 
 def razer_frame(colors):
@@ -737,8 +776,9 @@ def streamer():
             if not capability(key)["razer"] or not s["on"] or key in paused:
                 continue
             try:
+                sku = (lights.get(key) or found.get(key) or {}).get("sku")
                 s["frame"] = [[int(v) for v in c] for c in render(s, t, capability(key)["bulbs"])]
-                razer(key, razer_frame(s["frame"]))
+                razer(key, razer_frame(chroma_gamma(s["frame"], GAMMA.get(sku))))  # the page shows the uncorrected frame
             except Exception as e:  # one bad frame or network blip must not kill the stream
                 s["error"] = f"stream: {e}"
         time.sleep(max(0, t + 1 / FPS - time.time()))

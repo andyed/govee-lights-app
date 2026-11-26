@@ -209,6 +209,37 @@ class ModelChecks(unittest.TestCase):
         self.assertIn("schedule:", app.st["H619A"]["error"])
         self.assertEqual(app.st["H6008"]["effect"], "solid")
 
+    def test_chroma_gamma(self):
+        # Vectors computed with andyed/suffuse scripts/lan.mjs chromaGamma, so the port cannot drift.
+        px = [[82, 0, 10], [255, 200, 100], [250, 245, 240], [255, 0, 25], [0, 0, 0], [10, 10, 200], [255, 0, 1], [120, 118, 60]]
+        self.assertEqual(app.chroma_gamma(px, [2.2, 2.2, 3]),
+                         [[82, 0, 0], [255, 149, 15], [250, 245, 240], [255, 0, 0], [0, 0, 0], [0, 0, 200], [255, 0, 0], [120, 116, 15]])
+        self.assertEqual(app.chroma_gamma(px, [2, 2, 2]),
+                         [[82, 0, 1], [255, 157, 39], [250, 245, 240], [255, 0, 2], [0, 0, 0], [0, 0, 200], [255, 0, 0], [120, 116, 30]])
+        self.assertIs(app.chroma_gamma(px, None), px)
+        self.assertEqual(app.GAMMA.get("H608B"), [2, 2, 2])
+        self.assertEqual(app.GAMMA.get("H612B"), [2.2, 2.2, 3])
+        self.assertEqual(app.GAMMA.get("H61D3"), [2.2, 2.2, 3])
+        self.assertIsNone(app.GAMMA.get("H16C0"))  # LuminBlend+: gamma-calibrated, never inherit
+        self.assertIsNone(app.GAMMA.get("H805D"))
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "models.json"
+            p.write_text('{"models": {"H1": {"slots": 5, "gamma": [2, 2, 3]}, "H2": {"slots": 5, "gamma": [0, 2, 2]}, "H3": {"slots": 5, "gamma": [true, 2, 2]}}}')
+            self.assertEqual(app.read_gamma(p), {"H1": [2, 2, 3]})
+            self.assertEqual(app.read_gamma(Path(d) / "missing.json"), {})
+        app.add_light("neon", "Neon", "H61D3", "192.168.0.21")
+        app.add_light("floor", "Floor", "H16C0", "192.168.0.22")
+        app.push("neon", dict(on=True, effect="solid", colors=[[82, 0, 10]]))
+        app.push("floor", dict(on=True, effect="solid", colors=[[82, 0, 10]]))
+        with patch.object(app, "send") as send, patch.object(app.time, "sleep", side_effect=InterruptedError):
+            with self.assertRaises(InterruptedError):
+                app.streamer()
+            neon_raw = [base64.b64decode(c.args[2]["pt"]) for c in send.call_args_list if c.args[0] == "neon"][-1]
+            floor_raw = [base64.b64decode(c.args[2]["pt"]) for c in send.call_args_list if c.args[0] == "floor"][-1]
+        self.assertEqual(neon_raw[6:9], bytes([82, 0, 0]))   # leaked blue crushed on the wire
+        self.assertEqual(floor_raw[6:9], bytes([82, 0, 10]))  # calibrated lamp untouched
+        self.assertEqual(app.st["neon"]["frame"][0], [82, 0, 10])  # page keeps the chosen color
+
     def test_fake_scan_skus(self):
         with patch.object(app, "FAKE", 3), patch.object(app, "FAKE_SKUS", ["H805D", "H6008", "UNKNOWN"]):
             self.assertEqual([d["sku"] for d in app.discover().values()], ["H805D", "H6008", "UNKNOWN"])
